@@ -1,7 +1,10 @@
 using UnityEngine;
 using Nakama;
+using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using System.Text;
+using System.Diagnostics.CodeAnalysis;
 
 public class NakamaManager : MonoBehaviour
 {
@@ -11,17 +14,83 @@ public class NakamaManager : MonoBehaviour
 
     */
 
-    private IClient client;
+    private IClient client = null;
+    private ISocket socket = null; 
+    private ISession session = null;
+    private string authToken; 
     const string personaTag = "_test2persona";
-    const string playerNickName = "Shantanu_test_player";
-    string authToken; 
+
+    public string PersonaTag
+    {
+        get {return personaTag;}
+    }
+
+    const string playerNickName = "default-9"; //"Shantanu_test_player";
+    public string PlayerNickName
+    {
+        get {return playerNickName; }
+    }
+
+    
+    public delegate void MovementValidationEvent(bool IsValid, float PostionX, float PositionY);
+
+    // Declare the event
+    public event MovementValidationEvent OnEventTriggered;
+
+
+    /*----------------------------------------------*/
+    public class CardinalEvent
+    {
+        [Serializable]
+        [SuppressMessage("ReSharper", "InconsistentNaming")]
+        public struct Message
+        {
+            public string message;
+        }
+    }
+
+    public class CardinalReceipt
+    {
+        [Serializable]
+        [SuppressMessage("ReSharper", "InconsistentNaming")]
+        public struct TxHash
+        {
+            public string txHash;
+        }
+
+        [Serializable]
+        [SuppressMessage("ReSharper", "InconsistentNaming")]
+        public struct Errors
+        {
+            public string errors;
+        }
+
+        // The exact structure of this Result field will depend on the message you defined in your game.
+        [Serializable]
+        [SuppressMessage("ReSharper", "InconsistentNaming")]
+        public struct Result
+        {
+            
+            public bool isValid;
+            public float LocationX;
+            public float LocationY;
+        }
+        public Result? result;
+    }
+
+    /*-------------------------------------------------------------*/
+
     // Start is called once before the first execution of Update after the MonoBehaviour is created
     async void Start()
     {
         client = new Nakama.Client("http", "127.0.0.1", 7350, "defaultkey");
         Debug.Log(client);
-        var session = await client.AuthenticateDeviceAsync(SystemInfo.deviceUniqueIdentifier);
+        session = await client.AuthenticateDeviceAsync(SystemInfo.deviceUniqueIdentifier);
         authToken = session.AuthToken;
+        socket = client.NewSocket();
+        bool appearOnline = true;
+        int connectionTimeout = 30;
+        await socket.ConnectAsync(session, appearOnline, connectionTimeout);
         Debug.Log(authToken);
 
         try
@@ -36,50 +105,118 @@ public class NakamaManager : MonoBehaviour
             Debug.LogFormat("Error: {0}", ex.Message);
         }
 
-        try
-        {   
-            Debug.Log("Running test with create Api");
-            var payload = new Dictionary<string, object> {
-                {"Nickname", playerNickName},
-            };
-            Debug.Log(DictionaryToJson(payload));
-            var response = await client.RpcAsync(session, "tx/game/create-player", DictionaryToJson(payload));
-            Debug.Log(response);
-        }
-        catch (ApiResponseException ex)
+    }
+
+    private void OnDestroy()
+    {
+        if(client != null && session != null)
         {
-            Debug.LogFormat("Error: {0}", ex.Message);
+            client.SessionLogoutAsync(session);
+        }
+    }
+    
+    public async Task<Dictionary<string, object>> UpdatePlayerMovementState(float velocity, int direction, float locationX, float locationY)
+    {
+        if(session == null || session.IsExpired)
+        {
+            // more loud failure here.
+            return new Dictionary<string, object> { { "isvalid", true } };;
         }
 
-        //testing movement msg call should be moved to a utility function.
         try
         {
+            // TODO: cache and resuse this dict. 
             var payload = new Dictionary<string, object>
             {
+                { "persona", personaTag},
                 { "Target", playerNickName },
-                { "Velocity", 5 },
-                { "Direction", 0 },
-                { "LocationX", 0 },
-                { "LocationY", 0 }
+                { "Velocity", velocity },
+                { "Direction", direction },
+                { "LocationX", locationX },
+                { "LocationY", locationY }
             };
 
             Debug.Log(DictionaryToJson(payload));
             var response = await client.RpcAsync(session, "tx/game/movement-player", DictionaryToJson(payload));
-            Debug.Log(response);
+            if (!string.IsNullOrEmpty(response.Payload))
+            {
+                // Deserialize the JSON payload into a Dictionary
+                var responsePayload = JsonUtility.FromJson<Dictionary<string, object>>(response.Payload);
+                Debug.Log("Response Payload: " + response.Payload);
+            }
         }
-        catch (ApiResponseException ex)
+        catch(ApiResponseException ex)
         {
-            Debug.Log(ex);
             Debug.LogFormat("Error: {0}", ex.Message);
         }
+        return new Dictionary<string, object> { { "isvalid", true } };
+    }
+    
+    public async Task<Dictionary<string, object>> UpdatePlayerMovementState(Dictionary<string, object> payload )
+    {
 
-
+        if(session == null) 
+        {
+            return new Dictionary<string, object> { { "isvalid", true } };
+        }
+        
+        try
+        {
+            payload["persona"] = personaTag;
+            payload["TargetNickname"] = playerNickName;
+            Debug.Log(DictionaryToJson(payload));
+            var response = await client.RpcAsync(session, "tx/game/movement-player", DictionaryToJson(payload));
+            Debug.Log(response);
+        }
+        catch(ApiResponseException ex)
+        {
+            Debug.LogFormat("Error: {0}", ex.Message);
+        }
+        return new Dictionary<string, object> { { "isvalid", true } };
     }
 
     // Update is called once per frame
-    void Update()
+    void LateUpdate()
     {
-        
+        CheckNotifications();
+    }
+
+
+    public void CheckNotifications()
+    {
+        if(socket == null)
+        {
+            return;
+        }
+        socket.ReceivedNotification += notification =>
+        {
+            switch (notification.Subject)
+            {
+                case "receipt":
+                    {
+                        Debug.LogWarning($"Message Subject '{notification.Subject}' content '{notification.Content}'");
+                        var cardinalReceipt = JsonUtility.FromJson<CardinalReceipt>(notification.Content);
+                        if (cardinalReceipt.result != null)
+                        {
+                            OnEventTriggered?.Invoke(cardinalReceipt.result.Value.isValid,
+                                                    cardinalReceipt.result.Value.LocationX,
+                                                    cardinalReceipt.result.Value.LocationY);
+                        }
+                        break;
+                    }
+                case "event":
+                    {
+                        Debug.LogWarning($" Event Subject '{notification.Subject}' content '{notification.Content}'");
+                        var cardinalEvent = JsonUtility.FromJson<CardinalEvent>(notification.Content);
+                        break;
+                    }
+            }
+
+        };
+
+
+       
+
     }
 
     string DictionaryToJson(Dictionary<string, object> dictionary)
